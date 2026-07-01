@@ -563,6 +563,26 @@ pub fn compare_external_extraction(
         return (result_doc, extracted_text);
     }
 
+    // External-algorithm recovery — parity with Python trafilatura's
+    // `compare_extraction` (external.py). Python runs *readability* on the
+    // pre-cleaning backup tree and, when the main extraction is empty, adopts it
+    // (`len_text == 0 and len_algo > 0 -> use_readability`). Crucially, that
+    // rescue is gated only by `fast`, NOT by `focus == "precision"` — so Python
+    // recovers <form>-wrapped (ASP.NET WebForms) articles in precision mode.
+    //
+    // rs-trafilatura has no readability port, but `baseline` fills the same role:
+    // it runs on the uncleaned backup, and `basic_cleaning` (unlike doc_cleaning)
+    // does NOT strip <form>, so it recovers content the precision cleaning removed.
+    // Run it regardless of favor_precision to match Python; the outer caller still
+    // applies its own min_size threshold before adopting the result.
+    if len_extracted == 0 {
+        let baseline_src = dom::clone_document(original_doc);
+        let (baseline_doc, baseline_text) = baseline(&baseline_src);
+        if !baseline_text.is_empty() {
+            return (baseline_doc, baseline_text);
+        }
+    }
+
     // Prior cleaning for precision mode
     let cleaned_doc = if opts.favor_precision {
         let cloned = dom::clone_document(original_doc);
