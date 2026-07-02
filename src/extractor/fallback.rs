@@ -14,7 +14,15 @@ use super::tags::VALID_TAG_CATALOG;
 
 // === Baseline Extraction ===
 
-static BASIC_CLEANING_SELECTOR: &str = "aside, footer, nav, header, div[id*=\"footer\"], div[class*=\"footer\"], div[class*=\"consent\"], div[class*=\"cookie\"], div[class*=\"privacy\"], div[class*=\"gdpr\"], div[class*=\"banner\"], div[class*=\"modal\"], div[class*=\"popup\"], div[class*=\"newsletter\"], script, style, noscript";
+// Mirror Python trafilatura's BASIC_CLEAN_XPATH (settings.py):
+//   .//aside | .//div[contains(@class|@id,'footer')] | .//fencedframe | .//footer | .//script | .//style
+// baseline() is a last-resort rescue when the main extraction is empty; the
+// previous, much broader selector (nav/header/modal/banner/popup/consent/…)
+// deleted whole articles that happened to live inside such a container
+// (e.g. ASP.NET / Bootstrap layouts wrapping the body in a `modal`/`banner`
+// div), leaving the rescue empty. Stay minimal to match upstream and recover
+// that content.
+static BASIC_CLEANING_SELECTOR: &str = "aside, footer, fencedframe, div[id*=\"footer\"], div[class*=\"footer\"], script, style";
 
 /// Basic document cleaning for baseline extraction.
 ///
@@ -342,29 +350,36 @@ pub fn baseline(doc: &Document) -> (Document, String) {
         return (post_body_doc, tmp_text);
     }
 
-    // If we have some paragraphs from step 4, return them even if < 100 chars
-    if !dom::children(&post_body).is_empty() {
-        return (post_body_doc, tmp_text);
-    }
+    // NOTE (parity with Python trafilatura baseline, baseline.py): the paragraph
+    // step returns ONLY when temp_text > 100. Python does NOT return here just
+    // because postbody has children — a single short <p> (e.g. a title) must not
+    // pre-empt the default whole-<body> scrape below. The previous rust
+    // `if !post_body.is_empty() return` did exactly that, truncating table/CJK
+    // pages that carry most text outside <p> (e.g. ASP.NET TVEpisode.aspx: one
+    // 92-char <p> hid the ~310-char cast table). Fall through to the default
+    // strategy, rebuilding a fresh <body> exactly like Python's
+    // `postbody = Element("body")`.
 
     // 5. Default strategy: take everything from body
     if let Some(body_node) = doc.select("body").nodes().first() {
         let body = Selection::from(*body_node);
         let text = etree::iter_text(&body, "\n").trim().to_string();
 
-        if text.chars().count() > 100 {
-            let elem = etree::sub_element(&post_body, "p");
+        if !text.is_empty() {
+            let fresh_doc = etree::element("body");
+            let elem = etree::sub_element(&fresh_doc.select("body"), "p");
             etree::set_text(&elem, &text);
-            return (post_body_doc, text);
+            return (fresh_doc, text);
         }
     }
 
     // 6. Final fallback: entire document text
     let text = dom::text_content(&doc.select("*")).trim().to_string();
-    let elem = etree::sub_element(&post_body, "p");
+    let fresh_doc = etree::element("body");
+    let elem = etree::sub_element(&fresh_doc.select("body"), "p");
     etree::set_text(&elem, &text);
 
-    (post_body_doc, text)
+    (fresh_doc, text)
 }
 
 // === Fallback Comparison ===
@@ -772,12 +787,17 @@ mod tests {
 
     #[test]
     fn test_baseline_deduplication() {
+        // Paragraphs long enough that the deduplicated paragraph text exceeds the
+        // 100-char threshold, so baseline returns at the paragraph step (step 4).
+        // Below that threshold Python trafilatura's baseline falls through to the
+        // whole-<body> default strategy (a single <p>), which this test is not
+        // exercising — see test_baseline_short_paragraphs_use_body.
         let html = r#"<!DOCTYPE html>
         <html>
         <body>
-            <p>Duplicate text</p>
-            <p>Duplicate text</p>
-            <p>Unique text</p>
+            <p>This is a duplicated paragraph with more than enough length to matter.</p>
+            <p>This is a duplicated paragraph with more than enough length to matter.</p>
+            <p>A distinct unique paragraph also carrying a comfortable amount of text.</p>
         </body>
         </html>"#;
 
@@ -787,6 +807,28 @@ mod tests {
 
         // Should only have 2 paragraphs (duplicates removed)
         assert_eq!(body.select("p").length(), 2);
+    }
+
+    #[test]
+    fn test_baseline_short_paragraphs_use_body() {
+        // Parity with Python trafilatura baseline: when the paragraph text is
+        // <= 100 chars it must NOT return the partial paragraphs early — it falls
+        // through to the whole-<body> default strategy so table/inline text that
+        // lives outside <p> is not lost (e.g. ASP.NET TVEpisode.aspx listings).
+        let html = r#"<!DOCTYPE html>
+        <html>
+        <body>
+            <p>Short title</p>
+            <table><tr><td>Cast A</td><td>Cast B</td><td>Cast C</td></tr></table>
+        </body>
+        </html>"#;
+
+        let doc = Document::from(html);
+        let (_body_doc, text) = baseline(&doc);
+
+        // The <td> cast text (outside any <p>) must be recovered, not dropped.
+        assert!(text.contains("Cast A"), "text was: {text:?}");
+        assert!(text.contains("Cast C"), "text was: {text:?}");
     }
 
     #[test]

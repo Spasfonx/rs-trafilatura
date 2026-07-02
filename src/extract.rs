@@ -1049,7 +1049,18 @@ fn try_fallback_extraction(
             // Substantial improvement, use it
             return (result_text, Some(html));
         }
-        // Track as potential result (but may still try baseline rescue)
+        // Parity with Python trafilatura (external.py `compare_extraction`): when
+        // the MAIN extraction is empty, adopt any non-empty recovered content even
+        // below `min_extracted_size`. Python returns short articles (e.g. a
+        // 102-char ASP.NET TV listing, or a footer-wrapped article that only the
+        // recovery tree can see) rather than nothing, and — crucially — does NOT
+        // gate this on `focus == "precision"`. The `!favor_precision` rescue below
+        // never fires for the crawler backend (favor_precision=true), so without
+        // this branch these pages return empty. Only fires when current_len == 0,
+        // so it can never shrink or replace a good extraction.
+        if current_len == 0 && result_len > 0 {
+            return (result_text, Some(html));
+        }
     }
 
     // 2. Baseline as LAST RESORT rescue (unconditional, no candidateIsUsable)
