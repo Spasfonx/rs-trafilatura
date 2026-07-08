@@ -1049,7 +1049,18 @@ fn try_fallback_extraction(
             // Substantial improvement, use it
             return (result_text, Some(html));
         }
-        // Track as potential result (but may still try baseline rescue)
+        // Parity with Python trafilatura (external.py `compare_extraction`): when
+        // the MAIN extraction is empty, adopt any non-empty recovered content even
+        // below `min_extracted_size`. Python returns short articles (e.g. a
+        // 102-char ASP.NET TV listing, or a footer-wrapped article that only the
+        // recovery tree can see) rather than nothing, and — crucially — does NOT
+        // gate this on `focus == "precision"`. The `!favor_precision` rescue below
+        // never fires for the crawler backend (favor_precision=true), so without
+        // this branch these pages return empty. Only fires when current_len == 0,
+        // so it can never shrink or replace a good extraction.
+        if current_len == 0 && result_len > 0 {
+            return (result_text, Some(html));
+        }
     }
 
     // 2. Baseline as LAST RESORT rescue (unconditional, no candidateIsUsable)
@@ -1433,7 +1444,13 @@ fn extract_main_content_with_profile(doc: &Document, options: &Options, page_tit
                     let bu_text = extract_filtered_text_with_title(&bu_node, options, page_title);
                     let bu_len = bu_text.chars().count();
                     let current_len = text.chars().count();
-                    if bu_len > current_len * 2 && bu_len > 500 {
+                    // Adopt the bottom-up node only when it is both substantially
+                    // richer than the current text (avoids marginal swaps) and at
+                    // least the library's minimum article size. The floor tracks
+                    // `min_extracted_size` (200) rather than a hardcoded 500 so
+                    // short-but-valid articles (e.g. a ~430-char CJK bio page) are
+                    // recovered instead of leaving only a breadcrumb.
+                    if bu_len > current_len * 2 && bu_len > options.min_extracted_size {
                         text = bu_text;
                         html = extract_filtered_html(&bu_node, options);
                     }
@@ -1919,11 +1936,18 @@ fn find_content_node_bottom_up<'a>(doc: &'a Document) -> Option<Selection<'a>> {
     // Map from container index to accumulated score
     let mut scores = vec![0.0f64; containers.len()];
 
-    // Build a lookup: node pointer → container index
-    let mut ptr_to_idx: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // Build a lookup: node id → container index.
+    //
+    // NOTE: key by the DOM's stable `NodeId`, never by the address of the
+    // `NodeRef`. `dom_query::NodeRef` is `#[derive(Copy)]` (just `{ id, tree }`),
+    // so `std::ptr::from_ref(node)` yields the address of a *copy* living in a
+    // temporary Vec — the parent/grandparent lookups below hold copies from
+    // different temporaries, so pointer identity never matches and no paragraph
+    // score is ever propagated (the whole bottom-up scorer silently no-ops).
+    let mut id_to_idx: std::collections::HashMap<dom_query::NodeId, usize> =
+        std::collections::HashMap::new();
     for (i, node) in containers.iter().enumerate() {
-        let ptr = std::ptr::from_ref(node) as usize;
-        ptr_to_idx.insert(ptr, i);
+        id_to_idx.insert(node.id, i);
     }
 
     // Initialize scores with class/id bonus/penalty
@@ -1954,13 +1978,24 @@ fn find_content_node_bottom_up<'a>(doc: &'a Document) -> Option<Selection<'a>> {
 
         let text = el.text();
         let text = text.trim();
+        // NOTE: length is measured in BYTES here on purpose. This scorer is
+        // rust's precision-mode stand-in for Python's `recover_wild_text`
+        // (main_extractor.py) — Python recovers short/CJK pages through that
+        // path, which applies NO size or score threshold at all, whereas this
+        // scorer gates on `best_score >= 10`. Byte length inflates the length
+        // bonus ~3× on CJK, which is what lets a genuine CJK article (e.g. the
+        // ~430-char guoxue bio) clear that gate and be recovered — matching
+        // Python's *outcome* (428 chars). Switching to `chars().count()` here
+        // matches readability's own char-based scoring but drops CJK articles
+        // back below the threshold and re-empties exactly the pages this fix
+        // targets, so it would worsen baseline parity, not improve it.
         let text_len = text.len();
 
         if text_len < 25 {
             continue;
         }
 
-        // Base score: 1 + 1 per comma + 1 per 100 chars (capped at 3)
+        // Base score: 1 + 1 per comma + 1 per 100 bytes (capped at 3)
         let comma_count = text.matches(',').count();
         let len_bonus = (text_len / 100).min(3);
         let base_score = 1.0 + comma_count as f64 + len_bonus as f64;
@@ -1969,16 +2004,14 @@ fn find_content_node_bottom_up<'a>(doc: &'a Document) -> Option<Selection<'a>> {
         let parent = el.parent();
         if parent.length() > 0 {
             if let Some(parent_node) = parent.nodes().first() {
-                let parent_ptr = std::ptr::from_ref(parent_node) as usize;
-                if let Some(&parent_idx) = ptr_to_idx.get(&parent_ptr) {
+                if let Some(&parent_idx) = id_to_idx.get(&parent_node.id) {
                     scores[parent_idx] += base_score;
 
                     // Propagate to grandparent (half score)
                     let grandparent = parent.parent();
                     if grandparent.length() > 0 {
                         if let Some(gp_node) = grandparent.nodes().first() {
-                            let gp_ptr = std::ptr::from_ref(gp_node) as usize;
-                            if let Some(&gp_idx) = ptr_to_idx.get(&gp_ptr) {
+                            if let Some(&gp_idx) = id_to_idx.get(&gp_node.id) {
                                 scores[gp_idx] += base_score / 2.0;
                             }
                         }
@@ -2021,7 +2054,9 @@ fn find_content_node_bottom_up<'a>(doc: &'a Document) -> Option<Selection<'a>> {
     let best_node = containers[best_idx];
     let sel = Selection::from(best_node);
 
-    // Verify it has actual text content
+    // Verify it has actual text content. Byte count (see the byte-vs-char note
+    // in the scoring loop above): kept in bytes for consistency with the scorer
+    // and to stay lenient enough to recover CJK articles Python also recovers.
     let text_len = sel.text().trim().len();
     if text_len > 200 {
         Some(sel)
@@ -4188,6 +4223,64 @@ mod tests {
             }
             Err(err) => panic!("expected Ok(_), got Err({err:?})"),
         }
+    }
+
+    // Regression: the bottom-up (Readability-style) content scorer must actually
+    // propagate paragraph scores to their container. It previously keyed its
+    // lookup table by the *address* of a copied `NodeRef` (a `Copy` handle), so
+    // parent/grandparent lookups never matched and no score was ever propagated —
+    // the scorer silently returned `None`, which left CJK/short pages with only a
+    // breadcrumb (see guoxue.whu.edu.cn/…/167, rust 15 chars vs python 434). The
+    // container here has a *neutral* class name (no "content"/"article"/… bonus),
+    // so the ONLY way it can win is via propagated paragraph scores.
+    #[test]
+    fn find_content_node_bottom_up_propagates_paragraph_scores() {
+        let para = "Some substantial paragraph text, with several commas, that is \
+                    long enough to earn a length bonus, and to clear the minimum \
+                    extracted size threshold, so the scorer keeps it as content.";
+        let html = format!(
+            r#"<html><body>
+                <div class="weizhi"><a href="/">Home</a> &gt; <a href="/f">Faculty</a></div>
+                <div class="wen_right">
+                    <p>{para}</p>
+                    <p>{para}</p>
+                    <p>{para}</p>
+                </div>
+            </body></html>"#
+        );
+        let doc = Document::from(html.as_str());
+        let node = find_content_node_bottom_up(&doc)
+            .expect("bottom-up scorer must find the content container");
+        let text = node.text();
+        assert!(
+            text.contains("substantial paragraph text"),
+            "expected the content container, got: {text:?}"
+        );
+        // It must be the content div, not the link-dense breadcrumb.
+        assert_eq!(node.attr("class").as_deref(), Some("wen_right"));
+    }
+
+    // End-to-end companion: a page with no semantic content node whose body-level
+    // extraction only yields the breadcrumb must still recover the short article
+    // body via the bottom-up recovery, rather than returning near-empty content.
+    #[test]
+    fn extract_recovers_short_article_without_semantic_node() {
+        let para = "This is the real article body, written in ordinary prose, with \
+                    commas and enough length, so that it comfortably exceeds the \
+                    minimum extracted size and reads as genuine content rather than \
+                    navigation chrome or a breadcrumb trail.";
+        let html = format!(
+            r#"<html><head><title>Faculty bio page</title></head><body>
+                <div class="weizhi"><a href="/">Home</a> &gt; <a href="/f">Faculty</a></div>
+                <div class="wen_right"><p>{para}</p><p>{para}</p></div>
+            </body></html>"#
+        );
+        let result = extract_content(&html, &Options::default()).expect("Ok");
+        assert!(
+            result.content_text.contains("real article body"),
+            "expected recovered article, got: {:?}",
+            result.content_text
+        );
     }
 }
 

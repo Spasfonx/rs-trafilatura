@@ -14,7 +14,23 @@ use super::tags::VALID_TAG_CATALOG;
 
 // === Baseline Extraction ===
 
-static BASIC_CLEANING_SELECTOR: &str = "aside, footer, nav, header, div[id*=\"footer\"], div[class*=\"footer\"], div[class*=\"consent\"], div[class*=\"cookie\"], div[class*=\"privacy\"], div[class*=\"gdpr\"], div[class*=\"banner\"], div[class*=\"modal\"], div[class*=\"popup\"], div[class*=\"newsletter\"], script, style, noscript";
+// Close to Python trafilatura's BASIC_CLEAN_XPATH (settings.py):
+//   .//aside | .//div[contains(@class|@id,'footer')] | .//fencedframe | .//footer | .//script | .//style
+// baseline() is a last-resort rescue when the main extraction is empty. The
+// previous rust selector was much broader — it also dropped the *class-based*
+// containers `div[class*=modal|banner|popup|consent|cookie|privacy|gdpr|
+// newsletter]`, which deleted whole articles that happened to live inside such
+// a wrapper (ASP.NET / Bootstrap layouts nest the body in a `modal`/`banner`
+// div), leaving the rescue empty — that is the regression this alignment fixes.
+//
+// `nav`/`header` are kept in the strip set on purpose (go-trafilatura's
+// basicCleaning strips them too): they are structural boilerplate tags that
+// never carry main content, and omitting them let a pure-boilerplate page
+// (`<nav>…</nav><footer>…</footer>`) survive as recovered "content" instead of
+// returning empty with a warning. Stripping only the unambiguous structural
+// tags — not the content-bearing class heuristics — recovers the form-wrapped
+// articles without re-introducing boilerplate.
+static BASIC_CLEANING_SELECTOR: &str = "aside, footer, nav, fencedframe, div[id*=\"footer\"], div[class*=\"footer\"], script, style";
 
 /// Basic document cleaning for baseline extraction.
 ///
@@ -338,33 +354,65 @@ pub fn baseline(doc: &Document) -> (Document, String) {
     }
 
     let tmp_text = tmp_text.trim().to_string();
-    if tmp_text.chars().count() > 100 {
+    let tmp_len = tmp_text.chars().count();
+    if tmp_len > 100 {
         return (post_body_doc, tmp_text);
     }
 
-    // If we have some paragraphs from step 4, return them even if < 100 chars
-    if !dom::children(&post_body).is_empty() {
-        return (post_body_doc, tmp_text);
+    // The <p>-scraped text is short (<= 100 chars). Two very different pages land
+    // here, and they need opposite handling:
+    //
+    //   (a) an ordinary small article — the <p> IS the content, and the rest of
+    //       the body is boilerplate (footer/ad/nav divs). Return the paragraphs:
+    //       <p>-scraping already skipped discard nodes, so this stays clean,
+    //       whereas the whole-<body> scrape below would reintroduce that chrome.
+    //   (b) an ASP.NET/table page — the <p> is a stray title/label and the real
+    //       content lives outside <p> (tables/divs). Fall through to the
+    //       whole-<body> scrape so it is recovered (previously these returned
+    //       empty, because <form>-wrapped content was cleaned away).
+    //
+    // Distinguish by how much of the body text the paragraphs cover. Measured on
+    // the failing corpus the two classes are far apart: ordinary small pages sit
+    // at >= 20% (a 12-char <p> in a 60-char body), form/table pages at <= 2.3%
+    // (a 56-char title in a 2443-char body). A 10% cut separates them with a wide
+    // margin. Python trafilatura returns the paragraph step only when temp_text >
+    // 100; below that it falls through unconditionally — matching that exactly
+    // re-empties the ordinary pages here (their whole-body scrape is boilerplate),
+    // so we keep the paragraph result when it is clearly the article.
+    if tmp_len > 0 {
+        let body_len = doc
+            .select("body")
+            .nodes()
+            .first()
+            .map(|n| etree::iter_text(&Selection::from(*n), " ").trim().chars().count())
+            .unwrap_or(0);
+        if body_len == 0 || tmp_len * 10 >= body_len {
+            return (post_body_doc, tmp_text);
+        }
     }
+    // Fall through to the default whole-<body> strategy, rebuilding a fresh
+    // <body> exactly like Python's `postbody = Element("body")`.
 
     // 5. Default strategy: take everything from body
     if let Some(body_node) = doc.select("body").nodes().first() {
         let body = Selection::from(*body_node);
         let text = etree::iter_text(&body, "\n").trim().to_string();
 
-        if text.chars().count() > 100 {
-            let elem = etree::sub_element(&post_body, "p");
+        if !text.is_empty() {
+            let fresh_doc = etree::element("body");
+            let elem = etree::sub_element(&fresh_doc.select("body"), "p");
             etree::set_text(&elem, &text);
-            return (post_body_doc, text);
+            return (fresh_doc, text);
         }
     }
 
     // 6. Final fallback: entire document text
     let text = dom::text_content(&doc.select("*")).trim().to_string();
-    let elem = etree::sub_element(&post_body, "p");
+    let fresh_doc = etree::element("body");
+    let elem = etree::sub_element(&fresh_doc.select("body"), "p");
     etree::set_text(&elem, &text);
 
-    (post_body_doc, text)
+    (fresh_doc, text)
 }
 
 // === Fallback Comparison ===
@@ -563,6 +611,26 @@ pub fn compare_external_extraction(
         return (result_doc, extracted_text);
     }
 
+    // External-algorithm recovery — parity with Python trafilatura's
+    // `compare_extraction` (external.py). Python runs *readability* on the
+    // pre-cleaning backup tree and, when the main extraction is empty, adopts it
+    // (`len_text == 0 and len_algo > 0 -> use_readability`). Crucially, that
+    // rescue is gated only by `fast`, NOT by `focus == "precision"` — so Python
+    // recovers <form>-wrapped (ASP.NET WebForms) articles in precision mode.
+    //
+    // rs-trafilatura has no readability port, but `baseline` fills the same role:
+    // it runs on the uncleaned backup, and `basic_cleaning` (unlike doc_cleaning)
+    // does NOT strip <form>, so it recovers content the precision cleaning removed.
+    // Run it regardless of favor_precision to match Python; the outer caller still
+    // applies its own min_size threshold before adopting the result.
+    if len_extracted == 0 {
+        let baseline_src = dom::clone_document(original_doc);
+        let (baseline_doc, baseline_text) = baseline(&baseline_src);
+        if !baseline_text.is_empty() {
+            return (baseline_doc, baseline_text);
+        }
+    }
+
     // Prior cleaning for precision mode
     let cleaned_doc = if opts.favor_precision {
         let cloned = dom::clone_document(original_doc);
@@ -752,12 +820,17 @@ mod tests {
 
     #[test]
     fn test_baseline_deduplication() {
+        // Paragraphs long enough that the deduplicated paragraph text exceeds the
+        // 100-char threshold, so baseline returns at the paragraph step (step 4).
+        // Below that threshold Python trafilatura's baseline falls through to the
+        // whole-<body> default strategy (a single <p>), which this test is not
+        // exercising — see test_baseline_short_paragraphs_use_body.
         let html = r#"<!DOCTYPE html>
         <html>
         <body>
-            <p>Duplicate text</p>
-            <p>Duplicate text</p>
-            <p>Unique text</p>
+            <p>This is a duplicated paragraph with more than enough length to matter.</p>
+            <p>This is a duplicated paragraph with more than enough length to matter.</p>
+            <p>A distinct unique paragraph also carrying a comfortable amount of text.</p>
         </body>
         </html>"#;
 
@@ -767,6 +840,35 @@ mod tests {
 
         // Should only have 2 paragraphs (duplicates removed)
         assert_eq!(body.select("p").length(), 2);
+    }
+
+    #[test]
+    fn test_baseline_short_paragraphs_use_body() {
+        // Parity with Python trafilatura baseline: a short <p> (here a title)
+        // must NOT pre-empt the whole-<body> scrape when the real content lives
+        // outside <p> (a table, as on ASP.NET TVEpisode.aspx listings). The
+        // paragraph step returns early only when its text is a large share of
+        // the body; when it is a small sliver next to substantial non-<p>
+        // content, baseline falls through and recovers that content.
+        let html = r#"<!DOCTYPE html>
+        <html>
+        <body>
+            <p>Episode 5</p>
+            <table><tr>
+                <td>Directed by Jane Doe, who returned for the mid-season stretch and steered the story toward its climax.</td>
+                <td>Written by John Smith, weaving three parallel storylines that converge in the final act.</td>
+                <td>Guest starring a large ensemble cast introduced across the preceding episodes of the season.</td>
+            </tr></table>
+        </body>
+        </html>"#;
+
+        let doc = Document::from(html);
+        let (_body_doc, text) = baseline(&doc);
+
+        // The <td> text (outside any <p>) must be recovered, not dropped for the
+        // short title alone.
+        assert!(text.contains("Directed by Jane Doe"), "text was: {text:?}");
+        assert!(text.contains("final act"), "text was: {text:?}");
     }
 
     #[test]
