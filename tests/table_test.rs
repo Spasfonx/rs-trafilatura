@@ -140,3 +140,52 @@ fn extract_treats_single_row_table_as_layout() {
         Err(err) => panic!("expected Ok(_), got Err({err:?})"),
     }
 }
+
+// `colspan` / `rowspan` are page-controlled numbers. Before they were clamped,
+// `extract_table_text` sized its rowspan bookkeeping vector from the raw
+// `colspan`, so a single `<td colspan="2000000000">` requested 64 GB and the
+// process died (SIGKILL under a cgroup limit, `memory allocation failed` abort
+// otherwise). Clamps follow the HTML spec: colspan ≤ 1000, rowspan ≤ 65534.
+#[test]
+fn extract_survives_absurd_colspan() {
+    let html = format!(
+        r#"
+        <article>
+            <p>Intro text for the article with enough content.</p>
+            {PADDING}
+            <table>
+                <tr><th>H1</th><th>H2</th></tr>
+                <tr><td colspan="2000000000">WIDE</td><td>B</td></tr>
+                <tr><td>1</td><td>2</td></tr>
+            </table>
+        </article>
+    "#
+    );
+
+    let result = extract(&html).expect("expected Ok(_)");
+    assert!(result.content_text.contains("H1 | H2"));
+    assert!(result.content_text.contains("WIDE"));
+    assert!(result.content_text.contains("1 | 2"));
+}
+
+#[test]
+fn extract_survives_absurd_rowspan() {
+    let html = format!(
+        r#"
+        <article>
+            <p>Intro text for the article with enough content.</p>
+            {PADDING}
+            <table>
+                <tr><th>H1</th><th>H2</th></tr>
+                <tr><td rowspan="4000000000">TALL</td><td>B</td></tr>
+                <tr><td>2</td></tr>
+            </table>
+        </article>
+    "#
+    );
+
+    let result = extract(&html).expect("expected Ok(_)");
+    assert!(result.content_text.contains("H1 | H2"));
+    assert!(result.content_text.contains("TALL | B"));
+    assert!(result.content_text.contains("TALL | 2"));
+}

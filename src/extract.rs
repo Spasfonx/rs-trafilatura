@@ -3003,6 +3003,13 @@ fn parse_usize_attr(value: Option<&str>, default: usize) -> usize {
 
 const MAX_TABLE_CELLS: usize = 20_000;
 const MAX_TABLE_TEXT_LEN: usize = 200_000;
+/// Clamps for page-controlled span attributes, as the HTML spec mandates for
+/// browsers (colspan is clamped to 1000, rowspan to 65534). `colspan` sizes the
+/// rowspan bookkeeping vector below, so an unclamped value is a page-controlled
+/// allocation: `<td colspan="2000000000">` used to request 64 GB and kill the
+/// process before `MAX_TABLE_CELLS` was ever consulted.
+const MAX_COLSPAN: usize = 1_000;
+const MAX_ROWSPAN: usize = 65_534;
 
 fn push_rowspan_cells(
     rowspan: &mut [Option<(usize, String)>],
@@ -3053,8 +3060,8 @@ fn extract_table_text(table: &Selection) -> String {
 
             let colspan_attr = cell.attr("colspan");
             let rowspan_attr = cell.attr("rowspan");
-            let colspan = parse_usize_attr(colspan_attr.as_deref(), 1);
-            let rowspan_n = parse_usize_attr(rowspan_attr.as_deref(), 1);
+            let colspan = parse_usize_attr(colspan_attr.as_deref(), 1).min(MAX_COLSPAN);
+            let rowspan_n = parse_usize_attr(rowspan_attr.as_deref(), 1).min(MAX_ROWSPAN);
 
             let need_len = col.saturating_add(colspan);
             if rowspan.len() < need_len {
