@@ -143,6 +143,13 @@ fn decode_json_ld(
 }
 
 /// Recursively process schema values.
+///
+/// `parent` is only consulted for its presence (importance bonus) and copied
+/// into the `parent` field of the schemas that are kept, so it travels as a
+/// lightweight header: no `data`, no grandparent. Cloning the full parent
+/// chain and every visited subtree, as this used to do, was quadratic in the
+/// document: a 1.6 MB JSON-LD block with thousands of nested reviews exhausted
+/// several GB and killed the process.
 fn process_schema_value(
     value: &Value,
     parent: Option<&SchemaData>,
@@ -163,25 +170,45 @@ fn process_schema_value(
                 }
             } else {
                 let importance = calculate_importance(&types, parent, depth);
-                let schema_data = SchemaData {
+                // What the children need to know about this node: its types and
+                // importance. The subtree itself is only cloned for the schemas
+                // that are actually kept below.
+                let header = SchemaData {
                     types: types.clone(),
-                    data: map.clone(),
+                    data: serde_json::Map::new(),
                     importance,
-                    parent: parent.map(|p| Box::new(p.clone())),
+                    parent: parent.map(|p| {
+                        Box::new(SchemaData {
+                            types: p.types.clone(),
+                            data: serde_json::Map::new(),
+                            importance: p.importance,
+                            parent: None,
+                        })
+                    }),
                 };
 
                 // Categorize by type
-                if is_person_type(&types) {
-                    persons.push(schema_data.clone());
+                let bucket = if is_person_type(&types) {
+                    Some(&mut *persons)
                 } else if is_organization_type(&types) {
-                    organizations.push(schema_data.clone());
+                    Some(&mut *organizations)
                 } else if is_article_type(&types) {
-                    articles.push(schema_data.clone());
+                    Some(&mut *articles)
+                } else {
+                    None
+                };
+                if let Some(bucket) = bucket {
+                    bucket.push(SchemaData {
+                        types,
+                        data: map.clone(),
+                        importance,
+                        parent: header.parent.clone(),
+                    });
                 }
 
                 // Recurse into nested objects
                 for (_, val) in map {
-                    process_schema_value(val, Some(&schema_data), depth + 1, persons, organizations, articles);
+                    process_schema_value(val, Some(&header), depth + 1, persons, organizations, articles);
                 }
             }
         }
@@ -536,5 +563,39 @@ mod tests {
         // Author preserved, title updated
         assert_eq!(metadata.author, Some("Original Author".to_string()));
         assert_eq!(metadata.title, Some("New Title".to_string()));
+    }
+
+    /// Regression: a JSON-LD block with thousands of nested typed objects used
+    /// to clone the whole subtree and the full parent chain at every node
+    /// (quadratic), exhausting memory on a 1.6 MB `application/ld+json` script
+    /// seen in production. Must finish quickly and still yield the metadata.
+    #[test]
+    fn test_thousands_of_nested_reviews_do_not_blow_up() {
+        let reviews: Vec<String> = (0..3000)
+            .map(|i| {
+                format!(
+                    r#"{{"@type":"Review","reviewBody":"Review number {i}","author":{{"@type":"Person","name":"Reviewer {i}"}},"itemReviewed":{{"@type":"Organization","name":"Shop {i}"}}}}"#
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"@context":"https://schema.org","@type":"Organization","name":"Big Shop","review":[{}]}}"#,
+            reviews.join(",")
+        );
+        let html = format!(
+            r#"<html><head><script type="application/ld+json">{json}</script></head><body><p>Body</p></body></html>"#
+        );
+        let doc = Document::from(html.as_str());
+
+        let started = std::time::Instant::now();
+        let result = extract_json_ld(&doc, Metadata::default(), &Options::default());
+
+        assert_eq!(result.sitename.as_deref(), Some("Big Shop"));
+        assert!(result.author.is_some());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

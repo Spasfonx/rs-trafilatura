@@ -140,3 +140,112 @@ fn extract_treats_single_row_table_as_layout() {
         Err(err) => panic!("expected Ok(_), got Err({err:?})"),
     }
 }
+
+// `colspan` / `rowspan` are page-controlled numbers. Before they were clamped,
+// `extract_table_text` sized its rowspan bookkeeping vector from the raw
+// `colspan`, so a single `<td colspan="2000000000">` requested 64 GB and the
+// process died (SIGKILL under a cgroup limit, `memory allocation failed` abort
+// otherwise). Clamps follow the HTML spec: colspan ≤ 1000, rowspan ≤ 65534.
+#[test]
+fn extract_survives_absurd_colspan() {
+    let html = format!(
+        r#"
+        <article>
+            <p>Intro text for the article with enough content.</p>
+            {PADDING}
+            <table>
+                <tr><th>H1</th><th>H2</th></tr>
+                <tr><td colspan="2000000000">WIDE</td><td>B</td></tr>
+                <tr><td>1</td><td>2</td></tr>
+            </table>
+        </article>
+    "#
+    );
+
+    let result = extract(&html).expect("expected Ok(_)");
+    assert!(result.content_text.contains("H1 | H2"));
+    assert!(result.content_text.contains("WIDE"));
+    assert!(result.content_text.contains("1 | 2"));
+}
+
+#[test]
+fn extract_survives_absurd_rowspan() {
+    let html = format!(
+        r#"
+        <article>
+            <p>Intro text for the article with enough content.</p>
+            {PADDING}
+            <table>
+                <tr><th>H1</th><th>H2</th></tr>
+                <tr><td rowspan="4000000000">TALL</td><td>B</td></tr>
+                <tr><td>2</td></tr>
+            </table>
+        </article>
+    "#
+    );
+
+    let result = extract(&html).expect("expected Ok(_)");
+    assert!(result.content_text.contains("H1 | H2"));
+    assert!(result.content_text.contains("TALL | B"));
+    assert!(result.content_text.contains("TALL | 2"));
+}
+
+// The clamps above are not enough on their own: the cell text is repeated once
+// per spanned column (see `extract_handles_colspan_and_rowspan_in_table_text`),
+// so `colspan="1000"` on a 3 MB cell still built 3 GB of strings — and glibc
+// kept them in its arenas afterwards. The table's byte budget is now enforced
+// *before* each string is built, on every path that pushes a cell.
+#[test]
+fn extract_bounds_table_text_for_huge_spanned_cells() {
+    // 300 KB: repeated over 1000 columns this used to build 300 MB of table
+    // text, which the 1 MB `max_extracted_len` cap then hid from the output.
+    // With the budget the table contributes at most MAX_TABLE_TEXT_LEN.
+    let cell = "Zellentext mit Inhalt. ".repeat(13_000);
+    let html = format!(
+        r#"
+        <article>
+            <p>Intro text for the article with enough content.</p>
+            {PADDING}
+            <table>
+                <tr><th>H1</th><th>H2</th></tr>
+                <tr><td colspan="1000">{cell}</td><td>B</td></tr>
+                <tr><td>1</td><td>2</td></tr>
+            </table>
+        </article>
+    "#
+    );
+
+    let result = extract(&html).expect("expected Ok(_)");
+    assert!(result.content_text.contains("Zellentext mit Inhalt."));
+    assert!(
+        result.content_text.len() < 700_000,
+        "table text must stay within its budget, got {} bytes",
+        result.content_text.len()
+    );
+}
+
+#[test]
+fn extract_survives_deeply_nested_tables() {
+    let core = "Text im Kern der Tabelle. ".repeat(20_000); // ~500 KB
+    let depth = 60;
+    let html = format!(
+        r#"
+        <article>
+            <p>Intro text for the article with enough content.</p>
+            {PADDING}
+            {}{core}{}
+        </article>
+    "#,
+        "<table><tr><td>".repeat(depth),
+        "</td></tr></table>".repeat(depth)
+    );
+
+    let result = extract(&html).expect("expected Ok(_)");
+    assert!(result.content_text.contains("Text im Kern der Tabelle."));
+    assert!(
+        result.content_text.len() < core.len() * 2,
+        "nested tables must not multiply the text, got {} bytes for a {} byte core",
+        result.content_text.len(),
+        core.len()
+    );
+}

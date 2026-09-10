@@ -33,13 +33,129 @@ use crate::url_utils::{extract_filename, filenames_match};
 
 /// Main entry point for content extraction.
 #[allow(clippy::unnecessary_wraps)]
+/// Deepest nesting a document may have before extraction refuses it.
+///
+/// Measured on a 2 MB worker-thread stack: the recursive passes overflow
+/// somewhere between 5 000 and 20 000 levels and take 2 s at 5 000. Browsers cap
+/// the DOM at 512 nested elements; real pages stay well under 100.
+const MAX_DOM_DEPTH: usize = 1_024;
+
+/// Elements html5ever keeps open until they are explicitly closed. Elements
+/// the parser closes on its own (`p`, `li`, `td`, `tr`, `option`, ...) are left
+/// out so that sloppy but shallow markup is not over-counted.
+const NESTING_CONTAINERS: &[&str] = &[
+    "a", "article", "aside", "b", "blockquote", "center", "details", "div", "em", "fieldset",
+    "figure", "font", "footer", "form", "header", "i", "label", "main", "nav", "ol", "pre",
+    "section", "small", "span", "strong", "table", "u", "ul",
+];
+
+/// Lower bound on the nesting depth of `html`, from a single linear pass over
+/// the bytes: opening tags of [`NESTING_CONTAINERS`] push, their closing tags
+/// pop, and `<script>`, `<style>` and comments are skipped whole so that markup
+/// quoted inside them does not count. Stops as soon as `MAX_DOM_DEPTH` is
+/// exceeded. Cheap enough to run before the parser on every document.
+fn raw_nesting_estimate(html: &str) -> usize {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    let mut max_depth = 0;
+
+    while let Some(off) = bytes[i..].iter().position(|&b| b == b'<') {
+        i += off + 1;
+        if bytes[i..].starts_with(b"!--") {
+            i = find_ci(bytes, i, b"-->").map_or(bytes.len(), |p| p + 3);
+            continue;
+        }
+        let closing = bytes.get(i) == Some(&b'/');
+        if closing {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        if i == name_start {
+            continue;
+        }
+        let name = bytes[name_start..i].to_ascii_lowercase();
+        let name = name.as_slice();
+        if !closing && (name == b"script" || name == b"style") {
+            let end_tag: &[u8] = if name == b"script" { b"</script" } else { b"</style" };
+            i = find_ci(bytes, i, end_tag).map_or(bytes.len(), |p| p + end_tag.len());
+            continue;
+        }
+        if !NESTING_CONTAINERS.iter().any(|c| c.as_bytes() == name) {
+            continue;
+        }
+        if closing {
+            depth = depth.saturating_sub(1);
+        } else {
+            // `<div/>` is not self-closing in HTML, html5ever opens it too.
+            depth += 1;
+            if depth > max_depth {
+                max_depth = depth;
+                if max_depth > MAX_DOM_DEPTH {
+                    return max_depth;
+                }
+            }
+        }
+    }
+    max_depth
+}
+
+/// Position of the first case-insensitive occurrence of `needle` in
+/// `haystack[from..]`.
+fn find_ci(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+        .map(|p| from + p)
+}
+
+/// Maximum nesting depth of `document`, computed iteratively so that it is safe
+/// to call on the very documents it exists to reject.
+fn dom_depth(document: &Document) -> usize {
+    let mut max_depth = 0;
+    let mut stack = vec![(document.root(), 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        max_depth = max_depth.max(depth);
+        if depth >= MAX_DOM_DEPTH.saturating_add(1) {
+            // Deep enough to be refused; no need to walk the rest.
+            return depth;
+        }
+        for child in node.children() {
+            stack.push((child, depth + 1));
+        }
+    }
+    max_depth
+}
+
 pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractResult> {
     if cfg!(debug_assertions) {
         eprintln!("DEBUG: Starting content extraction (HTML length: {} chars)", html.len());
     }
 
+    // html5ever nests unclosed elements without limit, and its own tree
+    // builder is quadratic in the depth of the open-element stack: a page of
+    // 141k unclosed <div>s took 34 s to parse, then 226 s of recursive passes
+    // before overflowing the stack. The raw scan refuses such a page before the
+    // parser runs; the exact check on the tree catches whatever it misses.
+    let estimate = raw_nesting_estimate(html);
+    if estimate > MAX_DOM_DEPTH {
+        return Err(Error::ParseError(format!(
+            "document nests at least {estimate} levels deep, more than the {MAX_DOM_DEPTH} supported"
+        )));
+    }
+
     // Parse HTML document
     let document = Document::from(html);
+
+    let depth = dom_depth(&document);
+    if depth > MAX_DOM_DEPTH {
+        return Err(Error::ParseError(format!(
+            "document nests {depth} levels deep, more than the {MAX_DOM_DEPTH} supported"
+        )));
+    }
 
     let mut warnings = Vec::new();
 
@@ -3003,16 +3119,60 @@ fn parse_usize_attr(value: Option<&str>, default: usize) -> usize {
 
 const MAX_TABLE_CELLS: usize = 20_000;
 const MAX_TABLE_TEXT_LEN: usize = 200_000;
+/// Clamps for page-controlled span attributes, as the HTML spec mandates for
+/// browsers (colspan is clamped to 1000, rowspan to 65534). `colspan` sizes the
+/// rowspan bookkeeping vector below, so an unclamped value is a page-controlled
+/// allocation: `<td colspan="2000000000">` used to request 64 GB and kill the
+/// process before `MAX_TABLE_CELLS` was ever consulted.
+const MAX_COLSPAN: usize = 1_000;
+const MAX_ROWSPAN: usize = 65_534;
+
+/// Cuts `s` down to at most `max_len` bytes without splitting a character.
+fn truncate_to_char_boundary(s: &mut String, max_len: usize) {
+    if s.len() > max_len {
+        let mut cut = max_len;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+}
+
+/// Bytes the current table may still emit. Every string pushed into a row goes
+/// through [`TableBudget::take`] first, so the text a table builds is bounded by
+/// `MAX_TABLE_TEXT_LEN` *before* it is allocated, whatever the page declares.
+struct TableBudget {
+    remaining: usize,
+}
+
+impl TableBudget {
+    fn take(&mut self, bytes: usize) -> bool {
+        if bytes > self.remaining {
+            self.remaining = 0;
+            return false;
+        }
+        self.remaining -= bytes;
+        true
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+}
 
 fn push_rowspan_cells(
     rowspan: &mut [Option<(usize, String)>],
     row_cells: &mut Vec<String>,
     col: &mut usize,
+    budget: &mut TableBudget,
 ) {
     while *col < rowspan.len() {
         let Some((remaining, val)) = rowspan[*col].take() else {
             break;
         };
+        if !budget.take(val.len()) {
+            break;
+        }
         row_cells.push(val.clone());
 
         let next_remaining = remaining.saturating_sub(1);
@@ -3028,57 +3188,67 @@ fn extract_table_text(table: &Selection) -> String {
     let mut out = String::new();
     let mut rowspan: Vec<Option<(usize, String)>> = Vec::new();
     let mut total_cells: usize = 0;
+    let mut budget = TableBudget {
+        remaining: MAX_TABLE_TEXT_LEN,
+    };
 
     // Select rows directly from the table selection
     let tr_sel = table.select("tr");
-    
+
     for tr_node in tr_sel.nodes() {
-        if total_cells >= MAX_TABLE_CELLS || out.len() >= MAX_TABLE_TEXT_LEN {
+        if total_cells >= MAX_TABLE_CELLS || budget.exhausted() {
             break;
         }
 
         let tr = Selection::from(*tr_node);
-        
+
         let mut row_cells: Vec<String> = Vec::new();
         let mut col: usize = 0;
 
         // Select cells directly from the row selection
         let cell_sel = tr.select("td, th");
         for cell_node in cell_sel.nodes() {
-            push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col);
+            push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col, &mut budget);
 
             let cell = Selection::from(*cell_node);
             let raw = dom::text_content(&cell);
-            let text = clean_text(&raw);
+            let mut text = clean_text(&raw);
+            // A single cell cannot carry more than the whole table is allowed to.
+            truncate_to_char_boundary(&mut text, MAX_TABLE_TEXT_LEN);
 
             let colspan_attr = cell.attr("colspan");
             let rowspan_attr = cell.attr("rowspan");
-            let colspan = parse_usize_attr(colspan_attr.as_deref(), 1);
-            let rowspan_n = parse_usize_attr(rowspan_attr.as_deref(), 1);
+            let colspan = parse_usize_attr(colspan_attr.as_deref(), 1).min(MAX_COLSPAN);
+            let rowspan_n = parse_usize_attr(rowspan_attr.as_deref(), 1).min(MAX_ROWSPAN);
 
             let need_len = col.saturating_add(colspan);
             if rowspan.len() < need_len {
                 rowspan.resize_with(need_len, || None);
             }
 
+            // The text is repeated once per spanned column. Each repetition is
+            // paid for out of the table budget first: `colspan="1000"` on a 3 MB
+            // cell used to build 3 GB of strings here, and again in the rowspan
+            // bookkeeping below.
             for i in 0..colspan {
                 total_cells = total_cells.saturating_add(1);
-                if total_cells >= MAX_TABLE_CELLS {
+                if total_cells >= MAX_TABLE_CELLS || !budget.take(text.len()) {
                     break;
                 }
                 row_cells.push(text.clone());
                 if rowspan_n > 1 {
-                    rowspan[col.saturating_add(i)] = Some((rowspan_n.saturating_sub(1), text.clone()));
+                    rowspan[col.saturating_add(i)] =
+                        Some((rowspan_n.saturating_sub(1), text.clone()));
                 }
             }
 
             col = col.saturating_add(colspan);
-            if total_cells >= MAX_TABLE_CELLS {
+            if total_cells >= MAX_TABLE_CELLS || budget.exhausted() {
                 break;
             }
         }
 
-        push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col);
+        push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col, &mut budget);
 
         if row_cells.iter().all(|c| c.trim().is_empty()) {
             continue;
@@ -3089,10 +3259,6 @@ fn extract_table_text(table: &Selection) -> String {
         }
         // Use pipe separator to match table formatting convention
         out.push_str(&row_cells.join(" | "));
-
-        if out.len() >= MAX_TABLE_TEXT_LEN {
-            break;
-        }
     }
 
     out
