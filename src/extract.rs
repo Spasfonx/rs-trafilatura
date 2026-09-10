@@ -3011,15 +3011,52 @@ const MAX_TABLE_TEXT_LEN: usize = 200_000;
 const MAX_COLSPAN: usize = 1_000;
 const MAX_ROWSPAN: usize = 65_534;
 
+/// Cuts `s` down to at most `max_len` bytes without splitting a character.
+fn truncate_to_char_boundary(s: &mut String, max_len: usize) {
+    if s.len() > max_len {
+        let mut cut = max_len;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+}
+
+/// Bytes the current table may still emit. Every string pushed into a row goes
+/// through [`TableBudget::take`] first, so the text a table builds is bounded by
+/// `MAX_TABLE_TEXT_LEN` *before* it is allocated, whatever the page declares.
+struct TableBudget {
+    remaining: usize,
+}
+
+impl TableBudget {
+    fn take(&mut self, bytes: usize) -> bool {
+        if bytes > self.remaining {
+            self.remaining = 0;
+            return false;
+        }
+        self.remaining -= bytes;
+        true
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
 fn push_rowspan_cells(
     rowspan: &mut [Option<(usize, String)>],
     row_cells: &mut Vec<String>,
     col: &mut usize,
+    budget: &mut TableBudget,
 ) {
     while *col < rowspan.len() {
         let Some((remaining, val)) = rowspan[*col].take() else {
             break;
         };
+        if !budget.take(val.len()) {
+            break;
+        }
         row_cells.push(val.clone());
 
         let next_remaining = remaining.saturating_sub(1);
@@ -3035,28 +3072,33 @@ fn extract_table_text(table: &Selection) -> String {
     let mut out = String::new();
     let mut rowspan: Vec<Option<(usize, String)>> = Vec::new();
     let mut total_cells: usize = 0;
+    let mut budget = TableBudget {
+        remaining: MAX_TABLE_TEXT_LEN,
+    };
 
     // Select rows directly from the table selection
     let tr_sel = table.select("tr");
-    
+
     for tr_node in tr_sel.nodes() {
-        if total_cells >= MAX_TABLE_CELLS || out.len() >= MAX_TABLE_TEXT_LEN {
+        if total_cells >= MAX_TABLE_CELLS || budget.exhausted() {
             break;
         }
 
         let tr = Selection::from(*tr_node);
-        
+
         let mut row_cells: Vec<String> = Vec::new();
         let mut col: usize = 0;
 
         // Select cells directly from the row selection
         let cell_sel = tr.select("td, th");
         for cell_node in cell_sel.nodes() {
-            push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col);
+            push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col, &mut budget);
 
             let cell = Selection::from(*cell_node);
             let raw = dom::text_content(&cell);
-            let text = clean_text(&raw);
+            let mut text = clean_text(&raw);
+            // A single cell cannot carry more than the whole table is allowed to.
+            truncate_to_char_boundary(&mut text, MAX_TABLE_TEXT_LEN);
 
             let colspan_attr = cell.attr("colspan");
             let rowspan_attr = cell.attr("rowspan");
@@ -3068,24 +3110,29 @@ fn extract_table_text(table: &Selection) -> String {
                 rowspan.resize_with(need_len, || None);
             }
 
+            // The text is repeated once per spanned column. Each repetition is
+            // paid for out of the table budget first: `colspan="1000"` on a 3 MB
+            // cell used to build 3 GB of strings here, and again in the rowspan
+            // bookkeeping below.
             for i in 0..colspan {
                 total_cells = total_cells.saturating_add(1);
-                if total_cells >= MAX_TABLE_CELLS {
+                if total_cells >= MAX_TABLE_CELLS || !budget.take(text.len()) {
                     break;
                 }
                 row_cells.push(text.clone());
                 if rowspan_n > 1 {
-                    rowspan[col.saturating_add(i)] = Some((rowspan_n.saturating_sub(1), text.clone()));
+                    rowspan[col.saturating_add(i)] =
+                        Some((rowspan_n.saturating_sub(1), text.clone()));
                 }
             }
 
             col = col.saturating_add(colspan);
-            if total_cells >= MAX_TABLE_CELLS {
+            if total_cells >= MAX_TABLE_CELLS || budget.exhausted() {
                 break;
             }
         }
 
-        push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col);
+        push_rowspan_cells(&mut rowspan, &mut row_cells, &mut col, &mut budget);
 
         if row_cells.iter().all(|c| c.trim().is_empty()) {
             continue;
@@ -3096,10 +3143,6 @@ fn extract_table_text(table: &Selection) -> String {
         }
         // Use pipe separator to match table formatting convention
         out.push_str(&row_cells.join(" | "));
-
-        if out.len() >= MAX_TABLE_TEXT_LEN {
-            break;
-        }
     }
 
     out
