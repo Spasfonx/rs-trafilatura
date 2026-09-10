@@ -33,13 +33,129 @@ use crate::url_utils::{extract_filename, filenames_match};
 
 /// Main entry point for content extraction.
 #[allow(clippy::unnecessary_wraps)]
+/// Deepest nesting a document may have before extraction refuses it.
+///
+/// Measured on a 2 MB worker-thread stack: the recursive passes overflow
+/// somewhere between 5 000 and 20 000 levels and take 2 s at 5 000. Browsers cap
+/// the DOM at 512 nested elements; real pages stay well under 100.
+const MAX_DOM_DEPTH: usize = 1_024;
+
+/// Elements html5ever keeps open until they are explicitly closed. Elements
+/// the parser closes on its own (`p`, `li`, `td`, `tr`, `option`, ...) are left
+/// out so that sloppy but shallow markup is not over-counted.
+const NESTING_CONTAINERS: &[&str] = &[
+    "a", "article", "aside", "b", "blockquote", "center", "details", "div", "em", "fieldset",
+    "figure", "font", "footer", "form", "header", "i", "label", "main", "nav", "ol", "pre",
+    "section", "small", "span", "strong", "table", "u", "ul",
+];
+
+/// Lower bound on the nesting depth of `html`, from a single linear pass over
+/// the bytes: opening tags of [`NESTING_CONTAINERS`] push, their closing tags
+/// pop, and `<script>`, `<style>` and comments are skipped whole so that markup
+/// quoted inside them does not count. Stops as soon as `MAX_DOM_DEPTH` is
+/// exceeded. Cheap enough to run before the parser on every document.
+fn raw_nesting_estimate(html: &str) -> usize {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    let mut max_depth = 0;
+
+    while let Some(off) = bytes[i..].iter().position(|&b| b == b'<') {
+        i += off + 1;
+        if bytes[i..].starts_with(b"!--") {
+            i = find_ci(bytes, i, b"-->").map_or(bytes.len(), |p| p + 3);
+            continue;
+        }
+        let closing = bytes.get(i) == Some(&b'/');
+        if closing {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        if i == name_start {
+            continue;
+        }
+        let name = bytes[name_start..i].to_ascii_lowercase();
+        let name = name.as_slice();
+        if !closing && (name == b"script" || name == b"style") {
+            let end_tag: &[u8] = if name == b"script" { b"</script" } else { b"</style" };
+            i = find_ci(bytes, i, end_tag).map_or(bytes.len(), |p| p + end_tag.len());
+            continue;
+        }
+        if !NESTING_CONTAINERS.iter().any(|c| c.as_bytes() == name) {
+            continue;
+        }
+        if closing {
+            depth = depth.saturating_sub(1);
+        } else {
+            // `<div/>` is not self-closing in HTML, html5ever opens it too.
+            depth += 1;
+            if depth > max_depth {
+                max_depth = depth;
+                if max_depth > MAX_DOM_DEPTH {
+                    return max_depth;
+                }
+            }
+        }
+    }
+    max_depth
+}
+
+/// Position of the first case-insensitive occurrence of `needle` in
+/// `haystack[from..]`.
+fn find_ci(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+        .map(|p| from + p)
+}
+
+/// Maximum nesting depth of `document`, computed iteratively so that it is safe
+/// to call on the very documents it exists to reject.
+fn dom_depth(document: &Document) -> usize {
+    let mut max_depth = 0;
+    let mut stack = vec![(document.root(), 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        max_depth = max_depth.max(depth);
+        if depth >= MAX_DOM_DEPTH.saturating_add(1) {
+            // Deep enough to be refused; no need to walk the rest.
+            return depth;
+        }
+        for child in node.children() {
+            stack.push((child, depth + 1));
+        }
+    }
+    max_depth
+}
+
 pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractResult> {
     if cfg!(debug_assertions) {
         eprintln!("DEBUG: Starting content extraction (HTML length: {} chars)", html.len());
     }
 
+    // html5ever nests unclosed elements without limit, and its own tree
+    // builder is quadratic in the depth of the open-element stack: a page of
+    // 141k unclosed <div>s took 34 s to parse, then 226 s of recursive passes
+    // before overflowing the stack. The raw scan refuses such a page before the
+    // parser runs; the exact check on the tree catches whatever it misses.
+    let estimate = raw_nesting_estimate(html);
+    if estimate > MAX_DOM_DEPTH {
+        return Err(Error::ParseError(format!(
+            "document nests at least {estimate} levels deep, more than the {MAX_DOM_DEPTH} supported"
+        )));
+    }
+
     // Parse HTML document
     let document = Document::from(html);
+
+    let depth = dom_depth(&document);
+    if depth > MAX_DOM_DEPTH {
+        return Err(Error::ParseError(format!(
+            "document nests {depth} levels deep, more than the {MAX_DOM_DEPTH} supported"
+        )));
+    }
 
     let mut warnings = Vec::new();
 
