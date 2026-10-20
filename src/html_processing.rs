@@ -627,7 +627,10 @@ pub fn is_share_button_text(text: &str) -> bool {
         // "By [Author]" byline pattern - very short text only
         // Avoid matching "By the end of..." type content
         if lower.starts_with("by ") && trimmed.len() < 50 {
-            let after_by = &trimmed[3..];
+            // `lower` derives from `test_str`, so slice that one; `trimmed` may
+            // still carry a multi-byte prefix (emoji) where byte 3 is not a
+            // char boundary.
+            let after_by = test_str.get(3..).unwrap_or("");
             // Check that next char is uppercase (author name) and no sentence structure
             if let Some(first_char) = after_by.chars().next() {
                 if first_char.is_uppercase() && !after_by.contains(". ") && !after_by.contains(", the ") {
@@ -1080,6 +1083,16 @@ mod tests {
     use crate::options::Options;
 
     // Note: link_density_test* tests moved to src/link_density.rs
+
+    #[test]
+    fn share_button_byline_check_survives_multibyte_prefix() {
+        // Prod panic: "start byte index 3 is not a char boundary; it is inside '🛫'".
+        let with_emoji = is_share_button_text("🛫 By Air (Nearest Airports)");
+        assert_eq!(with_emoji, is_share_button_text("By Air (Nearest Airports)"));
+        assert!(is_share_button_text("By Reuters"));
+        assert!(!is_share_button_text("by the end of the day everything was fine"));
+        assert!(!is_share_button_text("Ünicode text that is not a byline at all"));
+    }
 
     #[test]
     fn test_text_chars_test() {

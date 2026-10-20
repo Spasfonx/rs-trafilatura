@@ -391,7 +391,7 @@ pub(crate) fn extract_content(html: &str, options: &Options) -> Result<ExtractRe
             let desc_lower = desc.to_lowercase();
             let content_lower = content_text.to_lowercase();
             // Only add if the description isn't already in the extraction
-            if !content_lower.contains(&desc_lower[..desc_lower.len().min(60)]) {
+            if !content_lower.contains(prefix_at_char_boundary(&desc_lower, 60)) {
                 let desc_len = desc.chars().count();
                 if desc_len >= 50 {
                     content_text = format!("{desc}\n\n{content_text}");
@@ -936,7 +936,7 @@ fn compute_extraction_quality_ml(
     f[10] = link_count as f64;
     f[11] = link_count as f64 / word_count.max(1) as f64;
 
-    let first_500 = &content_lower[..content_lower.len().min(500)];
+    let first_500 = prefix_at_char_boundary(&content_lower, 500);
     let bp_kws = ["cookie", "consent", "subscribe", "newsletter", "sign up",
                   "skip to", "copyright", "privacy", "terms", "accept"];
     f[12] = bp_kws.iter().filter(|kw| first_500.contains(*kw)).count() as f64;
@@ -1239,7 +1239,7 @@ fn apply_final_validations(
 
     // Apply maximum length limit
     if result.content_text.len() > options.max_extracted_len {
-        result.content_text.truncate(options.max_extracted_len);
+        truncate_to_char_boundary(&mut result.content_text, options.max_extracted_len);
         result.warnings.push(format!(
             "Content truncated to max length: {}",
             options.max_extracted_len
@@ -3129,13 +3129,21 @@ const MAX_ROWSPAN: usize = 65_534;
 
 /// Cuts `s` down to at most `max_len` bytes without splitting a character.
 fn truncate_to_char_boundary(s: &mut String, max_len: usize) {
-    if s.len() > max_len {
-        let mut cut = max_len;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
+    let cut = prefix_at_char_boundary(s, max_len).len();
+    s.truncate(cut);
+}
+
+/// The longest prefix of `s` that fits in `max_len` bytes without splitting a
+/// character. Byte-indexed slicing panics on multi-byte text otherwise.
+pub(crate) fn prefix_at_char_boundary(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        return s;
     }
+    let mut cut = max_len;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
 }
 
 /// Bytes the current table may still emit. Every string pushed into a row goes
@@ -4256,6 +4264,51 @@ mod tests {
             }
             Err(err) => panic!("expected Ok(_), got Err({err:?})"),
         }
+    }
+
+    #[test]
+    fn max_extracted_len_truncates_on_a_char_boundary() {
+        // "wörd " is 6 bytes; byte 500 falls inside the 'ö' of the 84th word.
+        let long_text = "wörd ".repeat(200);
+        let html = format!(r"<html><body><article><p>{long_text}</p></article></body></html>");
+        let options = Options {
+            max_extracted_len: 500,
+            ..Options::default()
+        };
+
+        let result = extract_content(&html, &options).expect("extraction succeeds");
+        assert!(result.content_text.len() <= 500);
+        assert!(result.content_text.ends_with("w"));
+        assert!(result.warnings.iter().any(|w| w.contains("truncated")));
+    }
+
+    #[test]
+    fn category_description_dedup_survives_multibyte_at_byte_60() {
+        // Prod panic: "end byte index 60 is not a char boundary; it is inside 'ü'".
+        let desc = "Kategorie: Kinderohrringe - sichere & liebevolle Ohrringe für Kinder ab 6 Jahren, \
+                    klein, funkelnd und oft mit einem Motiv, das sofort ins Herz hüpft.";
+        let html = format!(
+            r#"<html><head><meta property="og:type" content="product.group"></head>
+            <body><div class="collection-description">{desc}</div>
+            <main><article><p>{}</p></article></main></body></html>"#,
+            "Produkt Beschreibung Text ".repeat(40)
+        );
+        let options = Options {
+            page_type: Some(crate::page_type::PageType::Category),
+            ..Options::default()
+        };
+
+        let result = extract_content(&html, &options).expect("extraction succeeds");
+        assert!(result.content_text.contains("Kinderohrringe"));
+    }
+
+    #[test]
+    fn prefix_at_char_boundary_never_splits_a_char() {
+        assert_eq!(prefix_at_char_boundary("héllo", 2), "h");
+        assert_eq!(prefix_at_char_boundary("héllo", 3), "hé");
+        assert_eq!(prefix_at_char_boundary("héllo", 100), "héllo");
+        assert_eq!(prefix_at_char_boundary("🛫x", 3), "");
+        assert_eq!(prefix_at_char_boundary("", 5), "");
     }
 
     #[test]
