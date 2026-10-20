@@ -119,3 +119,25 @@ fn extract_handles_null_bytes_gracefully() {
     let result = extract(html);
     assert!(matches!(result, Ok(_) | Err(Error::NoContent)));
 }
+
+// A page with tens of thousands of unclosed `<div>` nests that deep in the DOM
+// (html5ever does not cap nesting; browsers stop at 512). Every recursive pass
+// over the tree then costs quadratic time and, on the 2 MB stack of a worker
+// thread, overflows between 5k and 20k levels — seen in production as SIGSEGV
+// exits (139) after minutes of CPU. The document must be refused up front.
+#[test]
+fn extract_refuses_absurdly_deep_documents_quickly() {
+    let html = format!(
+        r#"<html><head><title>T</title></head><body><main><article><p>Ein Absatz mit genug Text, um als Inhalt zu gelten, wie auf jeder normalen Seite.</p>{}kern</article></main></body></html>"#,
+        r#"<div class="x">"#.repeat(20_000)
+    );
+
+    let started = std::time::Instant::now();
+    let result = extract(&html);
+    assert!(result.is_err(), "expected Err(_), got Ok(_)");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}
